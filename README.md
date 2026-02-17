@@ -98,3 +98,8 @@ Create a **Fine-Grained Personal Access Token** with:
 - **Code Search**: 10 requests/minute (GitHub limit). ghleaks handles this automatically with adaptive waiting.
 - **File Downloads**: Uses the general 5,000 requests/hour limit. Controlled via `--threads`.
 - The tool will pause and resume automatically when rate limits are hit.
+
+## Example usage
+```
+ghleaks -q "companyname1" -q "companyname2" --token "$(gh auth token)" --threads 5 --report all_results.json > /tmp/ghleaks_result.txt 2>&1; echo "EXIT: $?"
+```

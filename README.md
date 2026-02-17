@@ -101,5 +101,5 @@ Create a **Fine-Grained Personal Access Token** with:
 
 ## Example usage
 ```
-ghleaks -q "companyname1" -q "companyname2" --token "$(gh auth token)" --threads 5 --report all_results.json > /tmp/ghleaks_result.txt 2>&1; echo "EXIT: $?"
+ghleaks -q "companyname1" -q "companyname2" --token "$(gh auth token)" --threads 5 --report all_results.json; echo "EXIT: $?"
 ```

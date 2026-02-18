@@ -32,6 +32,9 @@ go build -o ghleaks .
 # Multiple queries
 ./ghleaks -q "acmecorp.com" -q "acmecorp-internal" --token ghp_xxxxx
 
+# Queries with spaces in the term
+./ghleaks -q "acmecorp internal" --exact --token ghp_xxxxx
+
 # Exhaustive mode (overcomes GitHub's 1000-result cap)
 ./ghleaks -q "acmecorp" --exhaustive --token ghp_xxxxx
 

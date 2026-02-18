@@ -46,9 +46,10 @@ Example:
 }
 
 func init() {
-	rootCmd.Flags().StringSliceP("query", "q", nil, "Search keyword(s) (e.g., company name, domain). Can be specified multiple times.")
+	rootCmd.Flags().StringArrayP("query", "q", nil, "Search keyword(s) (e.g., company name, domain). Can be specified multiple times.")
 	rootCmd.Flags().String("query-file", "", "File containing queries, one per line")
 	rootCmd.Flags().StringP("token", "t", "", "GitHub personal access token (or set GITHUB_TOKEN / GH_TOKEN env var)")
+	rootCmd.Flags().Bool("exact", false, "Exact phrase matching (wraps each query in quotes so GitHub matches the exact phrase)")
 	rootCmd.Flags().Bool("include-gists", true, "Also search GitHub Gists")
 	rootCmd.Flags().Bool("include-forks", false, "Include forked repositories")
 	rootCmd.Flags().StringSlice("languages", nil, "Limit to specific programming languages")
@@ -79,7 +80,7 @@ func runScan(cmd *cobra.Command, args []string) error {
 	}
 
 	// Collect queries
-	queries, _ := cmd.Flags().GetStringSlice("query")
+	queries, _ := cmd.Flags().GetStringArray("query")
 	queryFile, _ := cmd.Flags().GetString("query-file")
 	if queryFile != "" {
 		fileQueries, err := readQueryFile(queryFile)
@@ -90,6 +91,16 @@ func runScan(cmd *cobra.Command, args []string) error {
 	}
 	if len(queries) == 0 {
 		return fmt.Errorf("at least one --query or --query-file is required")
+	}
+
+	// Exact phrase matching: wrap queries in double quotes for GitHub API
+	exact, _ := cmd.Flags().GetBool("exact")
+	if exact {
+		for i, q := range queries {
+			if !strings.HasPrefix(q, "\"") {
+				queries[i] = "\"" + q + "\""
+			}
+		}
 	}
 
 	// Token

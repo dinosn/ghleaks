@@ -70,6 +70,7 @@ Create a **Fine-Grained Personal Access Token** with:
 ## Flags
 
 ```
+--exact             Exact phrase matching (wraps each query in quotes so GitHub matches the exact phrase)
 --query, -q         Search keyword(s) (can be repeated)
 --query-file        File with queries, one per line
 --token, -t         GitHub PAT (or GITHUB_TOKEN / GH_TOKEN env var)

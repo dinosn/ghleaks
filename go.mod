@@ -1,4 +1,4 @@
-module ghleaks
+module github.com/dinosn/ghleaks
 
 go 1.25.4
 

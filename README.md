@@ -19,6 +19,9 @@ ghleaks combines GitHub's Code Search API with gitleaks' 100+ detection rules to
 ## Installation
 
 ```bash
+# Install directly with Go
+go install github.com/dinosn/ghleaks@latest
+
 # Build from source (requires Go 1.25+)
 go build -o ghleaks .
 ```

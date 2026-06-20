@@ -13,7 +13,7 @@ import (
 	"syscall"
 	"time"
 
-	"ghleaks/scanner"
+	"github.com/dinosn/ghleaks/scanner"
 
 	"github.com/spf13/cobra"
 )

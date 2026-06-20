@@ -8,8 +8,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"ghleaks/expander"
-	"ghleaks/github"
+	"github.com/dinosn/ghleaks/expander"
+	"github.com/dinosn/ghleaks/github"
 
 	"github.com/zricethezav/gitleaks/v8/config"
 	"github.com/zricethezav/gitleaks/v8/detect"

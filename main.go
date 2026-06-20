@@ -1,6 +1,6 @@
 package main
 
-import "ghleaks/cmd"
+import "github.com/dinosn/ghleaks/cmd"
 
 func main() {
 	cmd.Execute()

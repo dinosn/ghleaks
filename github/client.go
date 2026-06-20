@@ -41,11 +41,46 @@ type SearchCoverage struct {
 	CappedQueries []string
 }
 
+// SearchProgressEvent describes an exhaustive-search progress transition.
+type SearchProgressEvent string
+
+const (
+	SearchProgressProbe          SearchProgressEvent = "probe"
+	SearchProgressSplit          SearchProgressEvent = "split"
+	SearchProgressSearchStart    SearchProgressEvent = "search_start"
+	SearchProgressSearchComplete SearchProgressEvent = "search_complete"
+	SearchProgressSearchCapped   SearchProgressEvent = "search_capped"
+	SearchProgressComplete       SearchProgressEvent = "complete"
+)
+
+// SearchProgress reports progress through the adaptive exhaustive search space.
+type SearchProgress struct {
+	Event       SearchProgressEvent
+	Query       string
+	SearchQuery string
+	Range       string
+	Percent     float64
+	Searches    int
+	Results     int
+	TotalCount  int
+}
+
+// SearchProgressFunc receives progress updates during exhaustive search.
+type SearchProgressFunc func(SearchProgress)
+
 type codeSearchFunc func(context.Context, string, int) ([]SearchResult, int, error)
 
 type sizeRange struct {
 	min int
 	max int
+}
+
+type progressTracker struct {
+	query          string
+	report         SearchProgressFunc
+	totalUnits     int
+	completedUnits int
+	searches       int
 }
 
 // Client wraps the GitHub API with rate limiting and retry logic.
@@ -164,10 +199,19 @@ func (c *Client) SearchCode(ctx context.Context, query string, maxResults int) (
 // SearchCodeExhaustive recursively splits oversized queries by file size to
 // work around GitHub Search's 1000-result retrieval ceiling.
 func (c *Client) SearchCodeExhaustive(ctx context.Context, query string) ([]SearchResult, SearchCoverage, error) {
-	return searchCodeExhaustive(ctx, query, c.SearchCode)
+	return c.SearchCodeExhaustiveWithProgress(ctx, query, nil)
 }
 
-func searchCodeExhaustive(ctx context.Context, query string, search codeSearchFunc) ([]SearchResult, SearchCoverage, error) {
+// SearchCodeExhaustiveWithProgress runs exhaustive search and reports progress.
+func (c *Client) SearchCodeExhaustiveWithProgress(ctx context.Context, query string, progress SearchProgressFunc) ([]SearchResult, SearchCoverage, error) {
+	return searchCodeExhaustive(ctx, query, c.SearchCode, progress)
+}
+
+func searchCodeExhaustive(ctx context.Context, query string, search codeSearchFunc, progress SearchProgressFunc) ([]SearchResult, SearchCoverage, error) {
+	tracker := newProgressTracker(query, progress)
+	tracker.startSearch()
+	tracker.emit(SearchProgressProbe, query, sizeRange{}, "", 0, 0)
+
 	results, totalCount, err := search(ctx, query, gitHubSearchResultLimit)
 	coverage := SearchCoverage{
 		TotalCount: totalCount,
@@ -177,28 +221,32 @@ func searchCodeExhaustive(ctx context.Context, query string, search codeSearchFu
 		return results, coverage, err
 	}
 	if totalCount < gitHubSearchResultLimit {
+		tracker.completeAll()
+		tracker.emit(SearchProgressComplete, query, sizeRange{}, "", len(results), totalCount)
 		return results, coverage, nil
 	}
 
+	tracker.emit(SearchProgressSplit, query, sizeRange{}, "", len(results), totalCount)
+
 	// The initial result set is capped and biased by GitHub's ranking/sort.
 	// Discard it and collect only from disjoint size-bounded partitions.
-	results, splitCoverage, err := splitCodeBySize(ctx, query, sizeRange{min: 0, max: gitHubMaxCodeFileSize}, search)
+	results, splitCoverage, err := splitCodeBySize(ctx, query, sizeRange{min: 0, max: gitHubMaxCodeFileSize}, search, tracker)
 	splitCoverage.TotalCount = totalCount
 	splitCoverage.Searches++ // include the initial count/cap probe
 	return results, splitCoverage, err
 }
 
-func splitCodeBySize(ctx context.Context, query string, rng sizeRange, search codeSearchFunc) ([]SearchResult, SearchCoverage, error) {
+func splitCodeBySize(ctx context.Context, query string, rng sizeRange, search codeSearchFunc, tracker *progressTracker) ([]SearchResult, SearchCoverage, error) {
 	if rng.min >= rng.max {
-		return searchCodeBySize(ctx, query, rng, search)
+		return searchCodeBySize(ctx, query, rng, search, tracker)
 	}
 
 	mid := rng.min + (rng.max-rng.min)/2
-	leftResults, leftCoverage, err := searchCodeBySize(ctx, query, sizeRange{min: rng.min, max: mid}, search)
+	leftResults, leftCoverage, err := searchCodeBySize(ctx, query, sizeRange{min: rng.min, max: mid}, search, tracker)
 	if err != nil {
 		return leftResults, leftCoverage, err
 	}
-	rightResults, rightCoverage, err := searchCodeBySize(ctx, query, sizeRange{min: mid + 1, max: rng.max}, search)
+	rightResults, rightCoverage, err := searchCodeBySize(ctx, query, sizeRange{min: mid + 1, max: rng.max}, search, tracker)
 	if err != nil {
 		return append(leftResults, rightResults...), mergeCoverage(leftCoverage, rightCoverage), err
 	}
@@ -206,8 +254,11 @@ func splitCodeBySize(ctx context.Context, query string, rng sizeRange, search co
 	return append(leftResults, rightResults...), mergeCoverage(leftCoverage, rightCoverage), nil
 }
 
-func searchCodeBySize(ctx context.Context, query string, rng sizeRange, search codeSearchFunc) ([]SearchResult, SearchCoverage, error) {
+func searchCodeBySize(ctx context.Context, query string, rng sizeRange, search codeSearchFunc, tracker *progressTracker) ([]SearchResult, SearchCoverage, error) {
 	sizedQuery := addSizeQualifier(query, rng)
+	tracker.startSearch()
+	tracker.emit(SearchProgressSearchStart, sizedQuery, rng, rng.String(), 0, 0)
+
 	results, totalCount, err := search(ctx, sizedQuery, gitHubSearchResultLimit)
 	coverage := SearchCoverage{
 		Searches: 1,
@@ -218,11 +269,18 @@ func searchCodeBySize(ctx context.Context, query string, rng sizeRange, search c
 	if totalCount < gitHubSearchResultLimit || rng.min >= rng.max {
 		if totalCount >= gitHubSearchResultLimit {
 			coverage.CappedQueries = append(coverage.CappedQueries, sizedQuery)
+			tracker.completeRange(rng)
+			tracker.emit(SearchProgressSearchCapped, sizedQuery, rng, rng.String(), len(results), totalCount)
+		} else {
+			tracker.completeRange(rng)
+			tracker.emit(SearchProgressSearchComplete, sizedQuery, rng, rng.String(), len(results), totalCount)
 		}
 		return results, coverage, nil
 	}
 
-	splitResults, splitCoverage, err := splitCodeBySize(ctx, query, rng, search)
+	tracker.emit(SearchProgressSplit, sizedQuery, rng, rng.String(), len(results), totalCount)
+
+	splitResults, splitCoverage, err := splitCodeBySize(ctx, query, rng, search, tracker)
 	return splitResults, mergeCoverage(coverage, splitCoverage), err
 }
 
@@ -235,6 +293,72 @@ func mergeCoverage(a, b SearchCoverage) SearchCoverage {
 		Searches:      a.Searches + b.Searches,
 		CappedQueries: append(a.CappedQueries, b.CappedQueries...),
 	}
+}
+
+func newProgressTracker(query string, report SearchProgressFunc) *progressTracker {
+	return &progressTracker{
+		query:      query,
+		report:     report,
+		totalUnits: gitHubMaxCodeFileSize + 1,
+	}
+}
+
+func (p *progressTracker) startSearch() {
+	if p == nil {
+		return
+	}
+	p.searches++
+}
+
+func (p *progressTracker) completeAll() {
+	if p == nil {
+		return
+	}
+	p.completedUnits = p.totalUnits
+}
+
+func (p *progressTracker) completeRange(rng sizeRange) {
+	if p == nil {
+		return
+	}
+	p.completedUnits += rng.units()
+	if p.completedUnits > p.totalUnits {
+		p.completedUnits = p.totalUnits
+	}
+}
+
+func (p *progressTracker) emit(event SearchProgressEvent, searchQuery string, rng sizeRange, rangeLabel string, results, totalCount int) {
+	if p == nil || p.report == nil {
+		return
+	}
+	p.report(SearchProgress{
+		Event:       event,
+		Query:       p.query,
+		SearchQuery: searchQuery,
+		Range:       rangeLabel,
+		Percent:     p.percent(),
+		Searches:    p.searches,
+		Results:     results,
+		TotalCount:  totalCount,
+	})
+}
+
+func (p *progressTracker) percent() float64 {
+	if p == nil || p.totalUnits <= 0 {
+		return 100
+	}
+	return float64(p.completedUnits) * 100 / float64(p.totalUnits)
+}
+
+func (r sizeRange) units() int {
+	if r.max < r.min {
+		return 0
+	}
+	return r.max - r.min + 1
+}
+
+func (r sizeRange) String() string {
+	return fmt.Sprintf("size:%d..%d", r.min, r.max)
 }
 
 // SearchGists performs a gist search using the search API.

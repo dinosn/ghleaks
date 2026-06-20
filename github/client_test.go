@@ -28,7 +28,7 @@ func TestSearchCodeExhaustiveSplitsCappedQueryBySize(t *testing.T) {
 		}
 	}
 
-	results, coverage, err := searchCodeExhaustive(ctx, "acmecorp", search)
+	results, coverage, err := searchCodeExhaustive(ctx, "acmecorp", search, nil)
 	if err != nil {
 		t.Fatalf("searchCodeExhaustive returned error: %v", err)
 	}
@@ -75,7 +75,7 @@ func TestSearchCodeExhaustiveRecursivelySplitsCappedBuckets(t *testing.T) {
 		}
 	}
 
-	results, coverage, err := searchCodeExhaustive(ctx, "needle", search)
+	results, coverage, err := searchCodeExhaustive(ctx, "needle", search, nil)
 	if err != nil {
 		t.Fatalf("searchCodeExhaustive returned error: %v", err)
 	}
@@ -107,7 +107,7 @@ func TestSearchCodeBySizeReportsUnsplittableCappedBucket(t *testing.T) {
 		return makeSearchResults(query, gitHubSearchResultLimit), 2000, nil
 	}
 
-	results, coverage, err := searchCodeBySize(ctx, "needle", sizeRange{min: 42, max: 42}, search)
+	results, coverage, err := searchCodeBySize(ctx, "needle", sizeRange{min: 42, max: 42}, search, nil)
 	if err != nil {
 		t.Fatalf("searchCodeBySize returned error: %v", err)
 	}
@@ -116,6 +116,60 @@ func TestSearchCodeBySizeReportsUnsplittableCappedBucket(t *testing.T) {
 	}
 	wantCapped := []string{"needle size:42..42"}
 	assertStringSliceEqual(t, coverage.CappedQueries, wantCapped)
+}
+
+func TestSearchCodeExhaustiveReportsProgress(t *testing.T) {
+	ctx := context.Background()
+	search := func(ctx context.Context, query string, maxResults int) ([]SearchResult, int, error) {
+		switch query {
+		case "acmecorp":
+			return makeSearchResults(query, gitHubSearchResultLimit), 5000, nil
+		case "acmecorp size:0..192000":
+			return makeSearchResults(query, 2), 2, nil
+		case "acmecorp size:192001..384000":
+			return makeSearchResults(query, 3), 3, nil
+		default:
+			t.Fatalf("unexpected query %q", query)
+			return nil, 0, nil
+		}
+	}
+
+	var progress []SearchProgress
+	_, coverage, err := searchCodeExhaustive(ctx, "acmecorp", search, func(update SearchProgress) {
+		progress = append(progress, update)
+	})
+	if err != nil {
+		t.Fatalf("searchCodeExhaustive returned error: %v", err)
+	}
+	if coverage.Searches != 3 {
+		t.Fatalf("coverage.Searches = %d, want 3", coverage.Searches)
+	}
+
+	wantEvents := []SearchProgressEvent{
+		SearchProgressProbe,
+		SearchProgressSplit,
+		SearchProgressSearchStart,
+		SearchProgressSearchComplete,
+		SearchProgressSearchStart,
+		SearchProgressSearchComplete,
+	}
+	if len(progress) != len(wantEvents) {
+		t.Fatalf("got %d progress events, want %d: %#v", len(progress), len(wantEvents), progress)
+	}
+	for i, want := range wantEvents {
+		if progress[i].Event != want {
+			t.Fatalf("event %d = %q, want %q", i, progress[i].Event, want)
+		}
+	}
+	assertPercentNear(t, progress[0].Percent, 0)
+	assertPercentNear(t, progress[3].Percent, 50)
+	assertPercentNear(t, progress[5].Percent, 100)
+	if progress[2].Range != "size:0..192000" {
+		t.Fatalf("first split range = %q, want size:0..192000", progress[2].Range)
+	}
+	if progress[4].Searches != 3 {
+		t.Fatalf("second split search count = %d, want 3", progress[4].Searches)
+	}
 }
 
 func makeSearchResults(query string, count int) []SearchResult {
@@ -142,5 +196,12 @@ func assertStringSliceEqual(t *testing.T, got, want []string) {
 		if got[i] != want[i] {
 			t.Fatalf("got %v, want %v", got, want)
 		}
+	}
+}
+
+func assertPercentNear(t *testing.T, got, want float64) {
+	t.Helper()
+	if got < want-0.1 || got > want+0.1 {
+		t.Fatalf("percent = %.3f, want near %.3f", got, want)
 	}
 }

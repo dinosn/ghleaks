@@ -97,7 +97,7 @@ Create a **Fine-Grained Personal Access Token** with:
 4. **Detect**: Runs every file through gitleaks' full detection pipeline (100+ rules, entropy checks, keyword prefiltering, recursive decoding)
 5. **Report**: Outputs enriched findings with direct GitHub URLs
 
-Recent fixes improved `--exhaustive` coverage for broad keywords, added warnings for any final bucket that remains GitHub API-limited, and removed the old "powered by gitleaks" wording from the CLI banner.
+Recent fixes improved `--exhaustive` coverage for broad keywords, added percentage progress while adaptive search buckets are running, added warnings for any final bucket that remains GitHub API-limited, and removed the old "powered by gitleaks" wording from the CLI banner.
 
 ## Rate Limits
 

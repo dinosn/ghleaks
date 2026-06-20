@@ -178,7 +178,11 @@ func (s *Scanner) executeSearches(ctx context.Context, queries expander.QuerySet
 		)
 		if s.opts.Exhaustive {
 			var coverage github.SearchCoverage
-			results, coverage, err = s.client.SearchCodeExhaustive(ctx, query)
+			results, coverage, err = s.client.SearchCodeExhaustiveWithProgress(
+				ctx,
+				query,
+				exhaustiveProgressLogger(int(current), total),
+			)
 			totalCount = coverage.TotalCount
 			if err == nil && coverage.Searches > 1 {
 				fmt.Printf("[search] Query %q reported %d results; split into %d size-bounded searches.\n",
@@ -243,6 +247,56 @@ func (s *Scanner) executeSearches(ctx context.Context, queries expander.QuerySet
 	}
 
 	return allResults
+}
+
+func exhaustiveProgressLogger(queryIndex, totalQueries int) github.SearchProgressFunc {
+	return func(progress github.SearchProgress) {
+		overall := overallSearchPercent(queryIndex, totalQueries, progress.Percent)
+		switch progress.Event {
+		case github.SearchProgressProbe:
+			fmt.Printf("[search] exhaustive progress: %.1f%% overall (query %d/%d, probing base query; search %d)\n",
+				overall, queryIndex, totalQueries, progress.Searches)
+		case github.SearchProgressSplit:
+			if progress.Range == "" {
+				fmt.Printf("[search] exhaustive progress: %.1f%% overall (query %d/%d, %.1f%% current, %d+ results; splitting by file size)\n",
+					overall, queryIndex, totalQueries, progress.Percent, progress.TotalCount)
+			} else {
+				fmt.Printf("[search] exhaustive progress: %.1f%% overall (query %d/%d, %.1f%% current, splitting %s with %d+ results; searches: %d)\n",
+					overall, queryIndex, totalQueries, progress.Percent, progress.Range, progress.TotalCount, progress.Searches)
+			}
+		case github.SearchProgressSearchStart:
+			fmt.Printf("[search] exhaustive progress: %.1f%% overall (query %d/%d, %.1f%% current, searching %s; search %d)\n",
+				overall, queryIndex, totalQueries, progress.Percent, progress.Range, progress.Searches)
+		case github.SearchProgressSearchComplete:
+			fmt.Printf("[search] exhaustive progress: %.1f%% overall (query %d/%d, %.1f%% current, completed %s, %d results)\n",
+				overall, queryIndex, totalQueries, progress.Percent, progress.Range, progress.Results)
+		case github.SearchProgressSearchCapped:
+			fmt.Printf("[search] exhaustive progress: %.1f%% overall (query %d/%d, %.1f%% current, capped %s at %d+ results)\n",
+				overall, queryIndex, totalQueries, progress.Percent, progress.Range, progress.TotalCount)
+		case github.SearchProgressComplete:
+			fmt.Printf("[search] exhaustive progress: %.1f%% overall (query %d/%d, complete, %d results)\n",
+				overall, queryIndex, totalQueries, progress.Results)
+		}
+	}
+}
+
+func overallSearchPercent(queryIndex, totalQueries int, currentQueryPercent float64) float64 {
+	if totalQueries <= 0 {
+		return clampPercent(currentQueryPercent)
+	}
+	overall := (float64(queryIndex-1) + clampPercent(currentQueryPercent)/100) / float64(totalQueries) * 100
+	return clampPercent(overall)
+}
+
+func clampPercent(value float64) float64 {
+	switch {
+	case value < 0:
+		return 0
+	case value > 100:
+		return 100
+	default:
+		return value
+	}
 }
 
 func (s *Scanner) downloadAndScan(ctx context.Context, results []github.SearchResult) []EnrichedFinding {

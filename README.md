@@ -35,7 +35,7 @@ go build -o ghleaks .
 # Queries with spaces in the term
 ./ghleaks -q "acmecorp internal" --exact --token ghp_xxxxx
 
-# Exhaustive mode (overcomes GitHub's 1000-result cap)
+# Exhaustive mode (adaptively splits capped searches)
 ./ghleaks -q "acmecorp" --exhaustive --token ghp_xxxxx
 
 # Save results to JSON report
@@ -74,7 +74,7 @@ Create a **Fine-Grained Personal Access Token** with:
 --query, -q         Search keyword(s) (can be repeated)
 --query-file        File with queries, one per line
 --token, -t         GitHub PAT (or GITHUB_TOKEN / GH_TOKEN env var)
---exhaustive        Split queries to overcome 1000-result cap (slower)
+--exhaustive        Adaptively split capped searches for broader coverage (slower)
 --include-gists     Search GitHub Gists too (default: true)
 --include-forks     Include forked repositories (default: false)
 --languages         Limit to specific languages (e.g., python,javascript)
@@ -92,16 +92,19 @@ Create a **Fine-Grained Personal Access Token** with:
 ## How It Works
 
 1. **Search**: Uses GitHub's Code Search API to find files matching your keyword
-2. **Expand** (with `--exhaustive`): Splits queries by language, file extension, filename patterns, and size ranges to overcome the 1000-result API cap
+2. **Expand** (with `--exhaustive`): When GitHub reports 1,000+ results for a query, recursively splits it into disjoint `size:min..max` searches so later runs do not keep returning only the same first page set
 3. **Download**: Fetches raw file content for each match
 4. **Detect**: Runs every file through gitleaks' full detection pipeline (100+ rules, entropy checks, keyword prefiltering, recursive decoding)
 5. **Report**: Outputs enriched findings with direct GitHub URLs
+
+Recent fixes improved `--exhaustive` coverage for broad keywords, added warnings for any final bucket that remains GitHub API-limited, and removed the old "powered by gitleaks" wording from the CLI banner.
 
 ## Rate Limits
 
 - **Code Search**: 10 requests/minute (GitHub limit). ghleaks handles this automatically with adaptive waiting.
 - **File Downloads**: Uses the general 5,000 requests/hour limit. Controlled via `--threads`.
 - The tool will pause and resume automatically when rate limits are hit.
+- GitHub Search still cannot return more than 1,000 results for a single final bucket. Exhaustive mode warns if an exact split bucket remains capped, because coverage for that bucket is still API-limited.
 
 ## Example usage
 ```

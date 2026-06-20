@@ -171,7 +171,31 @@ func (s *Scanner) executeSearches(ctx context.Context, queries expander.QuerySet
 		current := atomic.AddInt32(&queryCount, 1)
 		fmt.Printf("[search] (%d/%d) %s\n", current, total, truncateQuery(query, 80))
 
-		results, totalCount, err := s.client.SearchCode(ctx, query, 1000)
+		var (
+			results    []github.SearchResult
+			totalCount int
+			err        error
+		)
+		if s.opts.Exhaustive {
+			var coverage github.SearchCoverage
+			results, coverage, err = s.client.SearchCodeExhaustive(ctx, query)
+			totalCount = coverage.TotalCount
+			if err == nil && coverage.Searches > 1 {
+				fmt.Printf("[search] Query %q reported %d results; split into %d size-bounded searches.\n",
+					truncateQuery(query, 40), totalCount, coverage.Searches-1)
+			}
+			if err == nil && len(coverage.CappedQueries) > 0 {
+				fmt.Printf("[warn] %d split queries still hit GitHub's 1000-result cap; coverage may be incomplete for those exact buckets.\n",
+					len(coverage.CappedQueries))
+				if s.opts.Verbose {
+					for _, cappedQuery := range coverage.CappedQueries {
+						fmt.Printf("[warn] Still capped: %s\n", truncateQuery(cappedQuery, 100))
+					}
+				}
+			}
+		} else {
+			results, totalCount, err = s.client.SearchCode(ctx, query, 1000)
+		}
 		if err != nil {
 			fmt.Printf("[warn] Search failed for query %q: %v\n", truncateQuery(query, 60), err)
 			continue

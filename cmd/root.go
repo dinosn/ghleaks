@@ -22,7 +22,7 @@ const banner = `
    ╔═══════════════════════╗
    ║  ghleaks              ║
    ║  GitHub Secret Search ║
-   ║  powered by gitleaks  ║
+   ║  Adaptive Leak Hunt   ║
    ╚═══════════════════════╝
 `
 
@@ -56,7 +56,7 @@ func init() {
 	rootCmd.Flags().StringSlice("extensions", nil, "Limit to specific file extensions")
 	rootCmd.Flags().StringSlice("orgs", nil, "Limit search to specific GitHub organizations")
 	rootCmd.Flags().StringSlice("users", nil, "Limit search to specific GitHub users")
-	rootCmd.Flags().Bool("exhaustive", false, "Use query expansion for comprehensive results (slower, overcomes 1000-result cap)")
+	rootCmd.Flags().Bool("exhaustive", false, "Use adaptive query splitting for broader coverage (slower)")
 	rootCmd.Flags().IntP("threads", "j", 5, "Concurrent file download threads")
 	rootCmd.Flags().StringP("report", "r", "", "Output report file path (JSON or CSV based on extension)")
 	rootCmd.Flags().String("report-format", "json", "Report format: json, csv")

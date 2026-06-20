@@ -92,11 +92,10 @@ func GenerateBaseQuery(opts ExpandOptions) string {
 }
 
 // QuickQueries returns the minimal set of queries for a quick scan.
-// This is just the base query, potentially with org/user qualifiers.
+// If language or extension filters are set, it returns one scoped query per filter.
 func QuickQueries(opts ExpandOptions) QuerySet {
-	base := GenerateBaseQuery(opts)
 	return QuerySet{
-		Queries:  []string{base},
+		Queries:  filteredBaseQueries(opts),
 		Strategy: "quick",
 	}
 }
@@ -168,19 +167,41 @@ func TargetedQueries(opts ExpandOptions) QuerySet {
 	}
 }
 
-// AllQueries combines exhaustive and targeted queries for maximum coverage.
+// AllQueries returns the top-level queries for adaptive exhaustive search.
+// Oversized buckets are split dynamically by the GitHub client.
 func AllQueries(opts ExpandOptions) QuerySet {
-	exhaustive := ExhaustiveQueries(opts)
-	targeted := TargetedQueries(opts)
-
-	all := append(exhaustive.Queries, targeted.Queries...)
-
-	// Also include the base query itself
-	base := GenerateBaseQuery(opts)
-	all = append([]string{base}, all...)
-
 	return QuerySet{
-		Queries:  all,
-		Strategy: "all",
+		Queries:  filteredBaseQueries(opts),
+		Strategy: "adaptive",
 	}
+}
+
+func filteredBaseQueries(opts ExpandOptions) []string {
+	base := GenerateBaseQuery(opts)
+	var queries []string
+
+	for _, lang := range opts.Languages {
+		queries = append(queries, fmt.Sprintf("%s language:%s", base, lang))
+	}
+	for _, ext := range opts.Extensions {
+		queries = append(queries, fmt.Sprintf("%s extension:%s", base, ext))
+	}
+	if len(queries) == 0 {
+		queries = append(queries, base)
+	}
+
+	return uniqueStrings(queries)
+}
+
+func uniqueStrings(values []string) []string {
+	seen := make(map[string]bool)
+	var unique []string
+	for _, value := range values {
+		if seen[value] {
+			continue
+		}
+		seen[value] = true
+		unique = append(unique, value)
+	}
+	return unique
 }

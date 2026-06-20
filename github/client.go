@@ -12,6 +12,12 @@ import (
 	gh "github.com/google/go-github/v57/github"
 )
 
+const (
+	gitHubSearchResultLimit = 1000
+	gitHubSearchPageSize    = 100
+	gitHubMaxCodeFileSize   = 384000
+)
+
 // SearchResult represents a single code search hit from GitHub.
 type SearchResult struct {
 	Repo     string // "owner/repo"
@@ -26,6 +32,20 @@ type SearchResult struct {
 type FileContent struct {
 	SearchResult
 	Content string
+}
+
+// SearchCoverage summarizes whether an exhaustive search had to split the query.
+type SearchCoverage struct {
+	TotalCount    int
+	Searches      int
+	CappedQueries []string
+}
+
+type codeSearchFunc func(context.Context, string, int) ([]SearchResult, int, error)
+
+type sizeRange struct {
+	min int
+	max int
 }
 
 // Client wraps the GitHub API with rate limiting and retry logic.
@@ -71,7 +91,7 @@ func (c *Client) SearchCode(ctx context.Context, query string, maxResults int) (
 	opts := &gh.SearchOptions{
 		Sort: "indexed",
 		ListOptions: gh.ListOptions{
-			PerPage: 100,
+			PerPage: gitHubSearchPageSize,
 		},
 		TextMatch: true,
 	}
@@ -129,16 +149,92 @@ func (c *Client) SearchCode(ctx context.Context, query string, maxResults int) (
 			})
 		}
 
-		if len(result.CodeResults) < 100 {
+		if len(result.CodeResults) < gitHubSearchPageSize {
 			break
 		}
 
-		if len(allResults) >= 1000 {
+		if len(allResults) >= gitHubSearchResultLimit {
 			break
 		}
 	}
 
 	return allResults, totalCount, nil
+}
+
+// SearchCodeExhaustive recursively splits oversized queries by file size to
+// work around GitHub Search's 1000-result retrieval ceiling.
+func (c *Client) SearchCodeExhaustive(ctx context.Context, query string) ([]SearchResult, SearchCoverage, error) {
+	return searchCodeExhaustive(ctx, query, c.SearchCode)
+}
+
+func searchCodeExhaustive(ctx context.Context, query string, search codeSearchFunc) ([]SearchResult, SearchCoverage, error) {
+	results, totalCount, err := search(ctx, query, gitHubSearchResultLimit)
+	coverage := SearchCoverage{
+		TotalCount: totalCount,
+		Searches:   1,
+	}
+	if err != nil {
+		return results, coverage, err
+	}
+	if totalCount < gitHubSearchResultLimit {
+		return results, coverage, nil
+	}
+
+	// The initial result set is capped and biased by GitHub's ranking/sort.
+	// Discard it and collect only from disjoint size-bounded partitions.
+	results, splitCoverage, err := splitCodeBySize(ctx, query, sizeRange{min: 0, max: gitHubMaxCodeFileSize}, search)
+	splitCoverage.TotalCount = totalCount
+	splitCoverage.Searches++ // include the initial count/cap probe
+	return results, splitCoverage, err
+}
+
+func splitCodeBySize(ctx context.Context, query string, rng sizeRange, search codeSearchFunc) ([]SearchResult, SearchCoverage, error) {
+	if rng.min >= rng.max {
+		return searchCodeBySize(ctx, query, rng, search)
+	}
+
+	mid := rng.min + (rng.max-rng.min)/2
+	leftResults, leftCoverage, err := searchCodeBySize(ctx, query, sizeRange{min: rng.min, max: mid}, search)
+	if err != nil {
+		return leftResults, leftCoverage, err
+	}
+	rightResults, rightCoverage, err := searchCodeBySize(ctx, query, sizeRange{min: mid + 1, max: rng.max}, search)
+	if err != nil {
+		return append(leftResults, rightResults...), mergeCoverage(leftCoverage, rightCoverage), err
+	}
+
+	return append(leftResults, rightResults...), mergeCoverage(leftCoverage, rightCoverage), nil
+}
+
+func searchCodeBySize(ctx context.Context, query string, rng sizeRange, search codeSearchFunc) ([]SearchResult, SearchCoverage, error) {
+	sizedQuery := addSizeQualifier(query, rng)
+	results, totalCount, err := search(ctx, sizedQuery, gitHubSearchResultLimit)
+	coverage := SearchCoverage{
+		Searches: 1,
+	}
+	if err != nil {
+		return results, coverage, err
+	}
+	if totalCount < gitHubSearchResultLimit || rng.min >= rng.max {
+		if totalCount >= gitHubSearchResultLimit {
+			coverage.CappedQueries = append(coverage.CappedQueries, sizedQuery)
+		}
+		return results, coverage, nil
+	}
+
+	splitResults, splitCoverage, err := splitCodeBySize(ctx, query, rng, search)
+	return splitResults, mergeCoverage(coverage, splitCoverage), err
+}
+
+func addSizeQualifier(query string, rng sizeRange) string {
+	return fmt.Sprintf("%s size:%d..%d", query, rng.min, rng.max)
+}
+
+func mergeCoverage(a, b SearchCoverage) SearchCoverage {
+	return SearchCoverage{
+		Searches:      a.Searches + b.Searches,
+		CappedQueries: append(a.CappedQueries, b.CappedQueries...),
+	}
 }
 
 // SearchGists performs a gist search using the search API.
@@ -155,7 +251,7 @@ func (c *Client) SearchGists(ctx context.Context, query string) ([]SearchResult,
 	gistQuery := query
 	opts := &gh.SearchOptions{
 		ListOptions: gh.ListOptions{
-			PerPage: 100,
+			PerPage: gitHubSearchPageSize,
 		},
 		TextMatch: true,
 	}
@@ -212,7 +308,7 @@ func (c *Client) SearchGists(ctx context.Context, query string) ([]SearchResult,
 			})
 		}
 
-		if len(result.CodeResults) < 100 {
+		if len(result.CodeResults) < gitHubSearchPageSize {
 			break
 		}
 	}

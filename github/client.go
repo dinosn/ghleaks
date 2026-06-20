@@ -48,6 +48,7 @@ const (
 	SearchProgressProbe          SearchProgressEvent = "probe"
 	SearchProgressSplit          SearchProgressEvent = "split"
 	SearchProgressSearchStart    SearchProgressEvent = "search_start"
+	SearchProgressFetchStart     SearchProgressEvent = "fetch_start"
 	SearchProgressSearchComplete SearchProgressEvent = "search_complete"
 	SearchProgressSearchCapped   SearchProgressEvent = "search_capped"
 	SearchProgressComplete       SearchProgressEvent = "complete"
@@ -59,10 +60,15 @@ type SearchProgress struct {
 	Query       string
 	SearchQuery string
 	Range       string
-	Percent     float64
-	Searches    int
-	Results     int
-	TotalCount  int
+	// Percent blends partitioning and fetched coverage so long split phases
+	// still report movement. CoveragePercent is the exact fetched coverage.
+	Percent          float64
+	CoveragePercent  float64
+	PartitionPercent float64
+	PendingRanges    int
+	Searches         int
+	Results          int
+	TotalCount       int
 }
 
 // SearchProgressFunc receives progress updates during exhaustive search.
@@ -81,6 +87,7 @@ type progressTracker struct {
 	totalUnits     int
 	completedUnits int
 	searches       int
+	pendingRanges  map[sizeRange]struct{}
 }
 
 // Client wraps the GitHub API with rate limiting and retry logic.
@@ -122,11 +129,23 @@ func NewClient(token string) (*Client, error) {
 // SearchCode performs a single code search query with pagination.
 // It returns up to maxResults results (capped at 1000 by GitHub).
 func (c *Client) SearchCode(ctx context.Context, query string, maxResults int) ([]SearchResult, int, error) {
+	if maxResults <= 0 {
+		maxResults = 1
+	}
+	if maxResults > gitHubSearchResultLimit {
+		maxResults = gitHubSearchResultLimit
+	}
+
 	var allResults []SearchResult
+	perPage := gitHubSearchPageSize
+	if maxResults < perPage {
+		perPage = maxResults
+	}
+
 	opts := &gh.SearchOptions{
 		Sort: "indexed",
 		ListOptions: gh.ListOptions{
-			PerPage: gitHubSearchPageSize,
+			PerPage: perPage,
 		},
 		TextMatch: true,
 	}
@@ -167,6 +186,9 @@ func (c *Client) SearchCode(ctx context.Context, query string, maxResults int) (
 		totalCount = result.GetTotal()
 
 		for _, cr := range result.CodeResults {
+			if len(allResults) >= maxResults {
+				break
+			}
 			repo := cr.GetRepository()
 			owner := repo.GetOwner().GetLogin()
 			repoName := repo.GetName()
@@ -184,11 +206,11 @@ func (c *Client) SearchCode(ctx context.Context, query string, maxResults int) (
 			})
 		}
 
-		if len(result.CodeResults) < gitHubSearchPageSize {
+		if len(result.CodeResults) < perPage {
 			break
 		}
 
-		if len(allResults) >= gitHubSearchResultLimit {
+		if len(allResults) >= maxResults {
 			break
 		}
 	}
@@ -196,7 +218,7 @@ func (c *Client) SearchCode(ctx context.Context, query string, maxResults int) (
 	return allResults, totalCount, nil
 }
 
-// SearchCodeExhaustive recursively splits oversized queries by file size to
+// SearchCodeExhaustive adaptively splits oversized queries by file size to
 // work around GitHub Search's 1000-result retrieval ceiling.
 func (c *Client) SearchCodeExhaustive(ctx context.Context, query string) ([]SearchResult, SearchCoverage, error) {
 	return c.SearchCodeExhaustiveWithProgress(ctx, query, nil)
@@ -209,79 +231,96 @@ func (c *Client) SearchCodeExhaustiveWithProgress(ctx context.Context, query str
 
 func searchCodeExhaustive(ctx context.Context, query string, search codeSearchFunc, progress SearchProgressFunc) ([]SearchResult, SearchCoverage, error) {
 	tracker := newProgressTracker(query, progress)
-	tracker.startSearch()
-	tracker.emit(SearchProgressProbe, query, sizeRange{}, "", 0, 0)
+	tracker.startSearch(SearchProgressProbe, query, sizeRange{}, "")
 
-	results, totalCount, err := search(ctx, query, gitHubSearchResultLimit)
+	_, totalCount, err := search(ctx, query, 1)
 	coverage := SearchCoverage{
 		TotalCount: totalCount,
 		Searches:   1,
 	}
 	if err != nil {
-		return results, coverage, err
+		return nil, coverage, err
 	}
 	if totalCount < gitHubSearchResultLimit {
+		tracker.startSearch(SearchProgressFetchStart, query, sizeRange{}, "")
+		results, _, err := search(ctx, query, gitHubSearchResultLimit)
+		coverage.Searches++
+		if err != nil {
+			return results, coverage, err
+		}
 		tracker.completeAll()
 		tracker.emit(SearchProgressComplete, query, sizeRange{}, "", len(results), totalCount)
 		return results, coverage, nil
 	}
 
-	tracker.emit(SearchProgressSplit, query, sizeRange{}, "", len(results), totalCount)
+	// The initial query is capped and biased by GitHub's ranking/sort. Collect
+	// only from disjoint size-bounded partitions.
+	left, right := (sizeRange{min: 0, max: gitHubMaxCodeFileSize}).split()
+	tracker.addPendingRanges(left, right)
+	tracker.emit(SearchProgressSplit, query, sizeRange{}, "", 0, totalCount)
 
-	// The initial result set is capped and biased by GitHub's ranking/sort.
-	// Discard it and collect only from disjoint size-bounded partitions.
-	results, splitCoverage, err := splitCodeBySize(ctx, query, sizeRange{min: 0, max: gitHubMaxCodeFileSize}, search, tracker)
+	results, splitCoverage, err := searchCodeBySizeRanges(ctx, query, []sizeRange{left, right}, search, tracker)
 	splitCoverage.TotalCount = totalCount
-	splitCoverage.Searches++ // include the initial count/cap probe
+	splitCoverage.Searches++ // include the initial count probe
 	return results, splitCoverage, err
 }
 
-func splitCodeBySize(ctx context.Context, query string, rng sizeRange, search codeSearchFunc, tracker *progressTracker) ([]SearchResult, SearchCoverage, error) {
-	if rng.min >= rng.max {
-		return searchCodeBySize(ctx, query, rng, search, tracker)
+func searchCodeBySizeRanges(ctx context.Context, query string, queue []sizeRange, search codeSearchFunc, tracker *progressTracker) ([]SearchResult, SearchCoverage, error) {
+	var allResults []SearchResult
+	var coverage SearchCoverage
+
+	for len(queue) > 0 {
+		rng := queue[0]
+		queue = queue[1:]
+
+		results, _, rangeCoverage, split, err := searchCodeBySize(ctx, query, rng, search, tracker)
+		coverage = mergeCoverage(coverage, rangeCoverage)
+		if err != nil {
+			return append(allResults, results...), coverage, err
+		}
+		allResults = append(allResults, results...)
+		if split {
+			left, right := rng.split()
+			queue = append(queue, left, right)
+			continue
+		}
 	}
 
-	mid := rng.min + (rng.max-rng.min)/2
-	leftResults, leftCoverage, err := searchCodeBySize(ctx, query, sizeRange{min: rng.min, max: mid}, search, tracker)
-	if err != nil {
-		return leftResults, leftCoverage, err
-	}
-	rightResults, rightCoverage, err := searchCodeBySize(ctx, query, sizeRange{min: mid + 1, max: rng.max}, search, tracker)
-	if err != nil {
-		return append(leftResults, rightResults...), mergeCoverage(leftCoverage, rightCoverage), err
-	}
-
-	return append(leftResults, rightResults...), mergeCoverage(leftCoverage, rightCoverage), nil
+	return allResults, coverage, nil
 }
 
-func searchCodeBySize(ctx context.Context, query string, rng sizeRange, search codeSearchFunc, tracker *progressTracker) ([]SearchResult, SearchCoverage, error) {
+func searchCodeBySize(ctx context.Context, query string, rng sizeRange, search codeSearchFunc, tracker *progressTracker) ([]SearchResult, int, SearchCoverage, bool, error) {
 	sizedQuery := addSizeQualifier(query, rng)
-	tracker.startSearch()
-	tracker.emit(SearchProgressSearchStart, sizedQuery, rng, rng.String(), 0, 0)
+	tracker.startSearch(SearchProgressSearchStart, sizedQuery, rng, rng.String())
 
-	results, totalCount, err := search(ctx, sizedQuery, gitHubSearchResultLimit)
+	_, totalCount, err := search(ctx, sizedQuery, 1)
 	coverage := SearchCoverage{
 		Searches: 1,
 	}
 	if err != nil {
-		return results, coverage, err
+		return nil, totalCount, coverage, false, err
 	}
-	if totalCount < gitHubSearchResultLimit || rng.min >= rng.max {
-		if totalCount >= gitHubSearchResultLimit {
-			coverage.CappedQueries = append(coverage.CappedQueries, sizedQuery)
-			tracker.completeRange(rng)
-			tracker.emit(SearchProgressSearchCapped, sizedQuery, rng, rng.String(), len(results), totalCount)
-		} else {
-			tracker.completeRange(rng)
-			tracker.emit(SearchProgressSearchComplete, sizedQuery, rng, rng.String(), len(results), totalCount)
-		}
-		return results, coverage, nil
+	if totalCount >= gitHubSearchResultLimit && rng.min < rng.max {
+		left, right := rng.split()
+		tracker.splitPendingRange(rng, left, right)
+		tracker.emit(SearchProgressSplit, sizedQuery, rng, rng.String(), 0, totalCount)
+		return nil, totalCount, coverage, true, nil
 	}
 
-	tracker.emit(SearchProgressSplit, sizedQuery, rng, rng.String(), len(results), totalCount)
-
-	splitResults, splitCoverage, err := splitCodeBySize(ctx, query, rng, search, tracker)
-	return splitResults, mergeCoverage(coverage, splitCoverage), err
+	tracker.startSearch(SearchProgressFetchStart, sizedQuery, rng, rng.String())
+	results, _, err := search(ctx, sizedQuery, gitHubSearchResultLimit)
+	coverage.Searches++
+	if err != nil {
+		return results, totalCount, coverage, false, err
+	}
+	tracker.completeRange(rng)
+	if totalCount >= gitHubSearchResultLimit {
+		coverage.CappedQueries = append(coverage.CappedQueries, sizedQuery)
+		tracker.emit(SearchProgressSearchCapped, sizedQuery, rng, rng.String(), len(results), totalCount)
+	} else {
+		tracker.emit(SearchProgressSearchComplete, sizedQuery, rng, rng.String(), len(results), totalCount)
+	}
+	return results, totalCount, coverage, false, nil
 }
 
 func addSizeQualifier(query string, rng sizeRange) string {
@@ -303,11 +342,38 @@ func newProgressTracker(query string, report SearchProgressFunc) *progressTracke
 	}
 }
 
-func (p *progressTracker) startSearch() {
+func (p *progressTracker) addPendingRanges(ranges ...sizeRange) {
+	if p == nil {
+		return
+	}
+	p.ensurePendingRanges()
+	for _, rng := range ranges {
+		p.pendingRanges[rng] = struct{}{}
+	}
+}
+
+func (p *progressTracker) splitPendingRange(parent, left, right sizeRange) {
+	if p == nil {
+		return
+	}
+	p.ensurePendingRanges()
+	delete(p.pendingRanges, parent)
+	p.pendingRanges[left] = struct{}{}
+	p.pendingRanges[right] = struct{}{}
+}
+
+func (p *progressTracker) ensurePendingRanges() {
+	if p.pendingRanges == nil {
+		p.pendingRanges = make(map[sizeRange]struct{})
+	}
+}
+
+func (p *progressTracker) startSearch(event SearchProgressEvent, searchQuery string, rng sizeRange, rangeLabel string) {
 	if p == nil {
 		return
 	}
 	p.searches++
+	p.emit(event, searchQuery, rng, rangeLabel, 0, 0)
 }
 
 func (p *progressTracker) completeAll() {
@@ -315,12 +381,14 @@ func (p *progressTracker) completeAll() {
 		return
 	}
 	p.completedUnits = p.totalUnits
+	p.pendingRanges = nil
 }
 
 func (p *progressTracker) completeRange(rng sizeRange) {
 	if p == nil {
 		return
 	}
+	delete(p.pendingRanges, rng)
 	p.completedUnits += rng.units()
 	if p.completedUnits > p.totalUnits {
 		p.completedUnits = p.totalUnits
@@ -331,23 +399,52 @@ func (p *progressTracker) emit(event SearchProgressEvent, searchQuery string, rn
 	if p == nil || p.report == nil {
 		return
 	}
+	coveragePercent := p.coveragePercent()
+	partitionPercent := p.partitionPercent()
 	p.report(SearchProgress{
-		Event:       event,
-		Query:       p.query,
-		SearchQuery: searchQuery,
-		Range:       rangeLabel,
-		Percent:     p.percent(),
-		Searches:    p.searches,
-		Results:     results,
-		TotalCount:  totalCount,
+		Event:            event,
+		Query:            p.query,
+		SearchQuery:      searchQuery,
+		Range:            rangeLabel,
+		Percent:          p.percent(coveragePercent, partitionPercent),
+		CoveragePercent:  coveragePercent,
+		PartitionPercent: partitionPercent,
+		PendingRanges:    len(p.pendingRanges),
+		Searches:         p.searches,
+		Results:          results,
+		TotalCount:       totalCount,
 	})
 }
 
-func (p *progressTracker) percent() float64 {
+func (p *progressTracker) percent(coveragePercent, partitionPercent float64) float64 {
+	if coveragePercent >= 100 {
+		return 100
+	}
+	return (coveragePercent + partitionPercent) / 2
+}
+
+func (p *progressTracker) coveragePercent() float64 {
 	if p == nil || p.totalUnits <= 0 {
 		return 100
 	}
 	return float64(p.completedUnits) * 100 / float64(p.totalUnits)
+}
+
+func (p *progressTracker) partitionPercent() float64 {
+	if p == nil || p.totalUnits <= 0 {
+		return 100
+	}
+	if len(p.pendingRanges) == 0 {
+		return p.coveragePercent()
+	}
+
+	maxPendingUnits := 0
+	for rng := range p.pendingRanges {
+		if units := rng.units(); units > maxPendingUnits {
+			maxPendingUnits = units
+		}
+	}
+	return float64(p.totalUnits-maxPendingUnits) * 100 / float64(p.totalUnits)
 }
 
 func (r sizeRange) units() int {
@@ -355,6 +452,11 @@ func (r sizeRange) units() int {
 		return 0
 	}
 	return r.max - r.min + 1
+}
+
+func (r sizeRange) split() (sizeRange, sizeRange) {
+	mid := r.min + (r.max-r.min)/2
+	return sizeRange{min: r.min, max: mid}, sizeRange{min: mid + 1, max: r.max}
 }
 
 func (r sizeRange) String() string {
